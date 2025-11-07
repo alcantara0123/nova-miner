@@ -5,6 +5,7 @@ import sys
 import json
 import traceback
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Optional, Tuple
@@ -32,19 +33,31 @@ DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "m
 # Cache for SMILES lookups to avoid redundant database queries
 _smiles_cache = {}
 _max_cache_size = 10000
+_cache_lock = threading.Lock()  # Lock for thread-safe cache operations
 
 def _get_smiles_cached(name: str) -> Optional[str]:
     """Get SMILES with caching to avoid redundant database queries."""
-    if name in _smiles_cache:
-        return _smiles_cache[name]
+    # Thread-safe cache read
+    with _cache_lock:
+        if name in _smiles_cache:
+            return _smiles_cache[name]
+    
+    # Cache miss - fetch from database
     try:
         smiles = get_smiles_from_reaction(name)
-        if len(_smiles_cache) >= _max_cache_size:
-            # Clear half of the cache when it gets too large
-            keys_to_remove = list(_smiles_cache.keys())[:_max_cache_size // 2]
-            for key in keys_to_remove:
-                del _smiles_cache[key]
-        _smiles_cache[name] = smiles
+        # Thread-safe cache write
+        with _cache_lock:
+            # Double-check if another thread added it while we were fetching
+            if name not in _smiles_cache:
+                if len(_smiles_cache) >= _max_cache_size:
+                    # Clear half of the cache when it gets too large
+                    keys_to_remove = list(_smiles_cache.keys())[:_max_cache_size // 2]
+                    for key in keys_to_remove:
+                        del _smiles_cache[key]
+                _smiles_cache[name] = smiles
+            else:
+                # Another thread added it, use that value
+                smiles = _smiles_cache[name]
         return smiles
     except Exception:
         return None
@@ -88,7 +101,6 @@ def iterative_sampling_loop(
     sampler_file_path: str,
     output_path: str,
     config: dict,
-    save_all_scores: bool = False
 ) -> None:
     """
     Infinite loop, runs until orchestrator kills it:
@@ -133,7 +145,8 @@ def iterative_sampling_loop(
             
             # Process molecules in parallel batches
             batch_size = min(100, len(names))
-            with ThreadPoolExecutor(max_workers=min(8, len(names))) as executor:
+            max_workers = max(1, min(8, len(names)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(_process_molecule_for_filtering, name, seen_inchikeys): name 
                           for name in names}
                 
@@ -178,10 +191,12 @@ def iterative_sampling_loop(
             continue
 
         # Calculate final scores per molecule
-        batch_scores = calculate_final_scores(score_dict, sampler_data, config, save_all_scores)
+        # Use iteration as current_epoch to track scoring iterations
+        batch_scores = calculate_final_scores(score_dict, sampler_data, config, current_epoch=iteration)
 
         try:
-            seen_inchikeys.update([k for k in batch_scores["InChIKey"].tolist() if k])
+            # Only add non-None InChIKeys to seen_inchikeys
+            seen_inchikeys.update([k for k in batch_scores["InChIKey"].tolist() if k is not None])
         except Exception:
             pass
 
@@ -193,8 +208,10 @@ def iterative_sampling_loop(
             top_pool = pd.concat([top_pool, batch_scores], ignore_index=True)
         
         # Drop duplicates and sort in one go, then take top
+        # Filter out rows with None InChIKeys before deduplication
+        top_pool = top_pool[top_pool["InChIKey"].notna()]
         top_pool = top_pool.drop_duplicates(subset=["InChIKey"], keep="first")
-        top_pool = top_pool.nlargest(config["num_molecules"], "score",keep="first")
+        top_pool = top_pool.nlargest(config["num_molecules"], "score", keep="first")
 
         # format to accepted format
         top_entries = {"molecules": top_pool["name"].tolist()}
@@ -204,12 +221,12 @@ def iterative_sampling_loop(
             json.dump(top_entries, f, ensure_ascii=False, indent=2)
 
         bt.logging.info(f"[Miner] Wrote {config['num_molecules']} top molecules to {output_path}")
-        bt.logging.info(f"[Miner] Average score: {top_pool['score'].mean()}")
+        if not top_pool.empty:
+            bt.logging.info(f"[Miner] Average score: {top_pool['score'].mean()}")
 
 def calculate_final_scores(score_dict: dict, 
         sampler_data: dict, 
         config: dict, 
-        save_all_scores: bool = True,
         current_epoch: int = 0) -> pd.DataFrame:
     """
     Calculate final scores per molecule
@@ -223,7 +240,8 @@ def calculate_final_scores(score_dict: dict,
     inchikey_list = [None] * len(smiles)
     
     # Process InChIKey calculation in parallel batches
-    with ThreadPoolExecutor(max_workers=min(8, len(smiles))) as executor:
+    max_workers = max(1, min(8, len(smiles)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {executor.submit(_process_molecule_for_inchikey, s): idx 
                          for idx, s in enumerate(smiles)}
         
@@ -238,6 +256,25 @@ def calculate_final_scores(score_dict: dict,
     # Vectorize score calculations using numpy
     targets = score_dict[0]['target_scores']
     antitargets = score_dict[0]['antitarget_scores']
+    
+    # Validate that targets and antitargets have the correct structure
+    num_molecules = len(names)
+    if not targets or not isinstance(targets, list):
+        bt.logging.error("[Miner] Invalid target_scores: empty or not a list")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+    
+    if not antitargets or not isinstance(antitargets, list):
+        bt.logging.error("[Miner] Invalid antitarget_scores: empty or not a list")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+    
+    # Validate that each target/antitarget list has the same length as names
+    if any(len(t) != num_molecules for t in targets):
+        bt.logging.error(f"[Miner] Target scores length mismatch: expected {num_molecules} molecules")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
+    
+    if any(len(a) != num_molecules for a in antitargets):
+        bt.logging.error(f"[Miner] Antitarget scores length mismatch: expected {num_molecules} molecules")
+        return pd.DataFrame(columns=["name", "smiles", "InChIKey", "score"])
     
     # Convert to numpy arrays for vectorized operations
     # targets is a list of lists, where each inner list has scores for all molecules
@@ -259,15 +296,6 @@ def calculate_final_scores(score_dict: dict,
         "score": final_scores
     })
 
-    if save_all_scores:
-        all_scores = {"scored_molecules": [(mol["name"], mol["score"]) for mol in batch_scores.to_dict(orient="records")]}
-        all_scores_path = os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")
-        if os.path.exists(all_scores_path):
-            with open(all_scores_path, "r") as f:
-                all_previous_scores = json.load(f)
-            all_scores["scored_molecules"] = all_previous_scores["scored_molecules"] + all_scores["scored_molecules"]
-        with open(all_scores_path, "w") as f:
-            json.dump(all_scores, f, ensure_ascii=False, indent=2)
 
     return batch_scores
 
@@ -277,7 +305,6 @@ def main(config: dict):
         sampler_file_path=os.path.join(OUTPUT_DIR, "sampler_file.json"),
         output_path=os.path.join(OUTPUT_DIR, "result.json"),
         config=config,
-        save_all_scores=True,
     )
  
 
