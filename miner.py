@@ -116,13 +116,6 @@ def calculate_final_scores(score_dict: dict, sampler_data: dict, config: dict, s
         "score": final_scores
     })
 
-    if save_all_scores:
-        all_scores_path = os.path.join(OUTPUT_DIR, f"all_scores_{current_epoch}.json")
-        records = [(r["name"], float(r["score"])) for r in df.to_dict(orient="records")]
-        with open(all_scores_path + ".tmp", "w") as f:
-            json.dump({"scored_molecules": records}, f, ensure_ascii=False)
-        os.replace(all_scores_path + ".tmp", all_scores_path)
-
     return df
 
 # ----------------------------
@@ -142,6 +135,8 @@ def iterative_sampling_loop(db_path: str, sampler_file_path: str, output_path: s
     target_time=100.0
     min_samples=100
     max_samples=5000
+    score_improvement=0.0
+    prev_mean_score: Optional[float] = None
 
     while True:
         iter_start = time.time()
@@ -216,6 +211,25 @@ def iterative_sampling_loop(db_path: str, sampler_file_path: str, output_path: s
                 json.dump({"molecules": top_pool["name"].tolist()}, f, ensure_ascii=False)
             os.replace(tmp, output_path)
             bt.logging.info(f"[Miner] Wrote top {len(top_pool)} molecules to {output_path}")
+
+        current_mean = float(top_pool["score"].mean()) if not top_pool.empty else 0.0
+        improvement_pct = 0.0
+        if prev_mean_score is not None and prev_mean_score != 0:
+            improvement_pct = (current_mean - prev_mean_score) / abs(prev_mean_score)
+
+        if iteration > 3 and not top_pool.empty:
+            score_improvement = max(0, improvement_pct)
+            
+            if score_improvement < 0.01:
+                # Too many duplicates or stagnation → explore more
+                mutation_prob = min(0.5, mutation_prob * 1.3)
+                elite_frac = max(0.2, elite_frac * 0.85)
+            elif score_improvement > 0.05:
+                # High diversity + improving → exploit
+                mutation_prob = max(0.05, mutation_prob * 0.9)
+                elite_frac = min(0.8, elite_frac * 1.1)
+
+        prev_mean_score = current_mean
 
         iter_end = time.time()
         ratio = (iter_end-iter_start) / target_time
